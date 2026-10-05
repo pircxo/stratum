@@ -11,28 +11,33 @@ production, at a scale one person can actually read end to end.
   of block pruning or dictionary decoding is worse than a simple, obviously
   correct one — this project would rather be small and right than large and
   shaky.
-- **New logic needs a test.** Storage format changes need a round-trip test;
-  query engine changes need an end-to-end query test with a known-correct
-  expected result; parser changes need a parser test.
+- **New logic needs a test.** Storage format changes need a round-trip test
+  and a corrupt-input test; query engine changes need an end-to-end query
+  test with a known-correct expected result, and new SQL features should be
+  added to the random query generator and oracle in `tests/differential.rs`;
+  parser changes need a parser test.
 - **`cargo fmt` and `cargo clippy` clean before a PR.** CI enforces both.
 
 ## Project layout
 
 ```
-src/storage/   on-disk columnar format: writer, reader, block/footer layout
-src/encoding/  plain (Int64) and dictionary (Utf8) column encodings
-src/query/     lexer, parser, AST, and the scan/filter/project executor
-src/bin/       the `stratum` CLI (load + query) and the `bench_prune` benchmark
-tests/         end-to-end integration tests
+src/storage/     on-disk columnar format: writer, reader + footer validation
+src/encoding.rs  bit-packing, frame-of-reference, delta and dictionary codecs
+src/query/       lexer, parser, AST, and the executor (pruning, vectorized
+                 filters, top-k, parallel aggregation)
+src/bin/         the `stratum` CLI (load / inspect / query) and `bench_prune`
+tests/           end-to-end, differential (vs. a naive oracle), storage
+                 validation, and CLI tests
 ```
 
 ## Local development
 
 ```bash
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo build --locked --all-targets
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
+cargo doc --locked --no-deps
 ```
 
 ## Reporting issues
@@ -40,3 +45,8 @@ cargo fmt --check
 Open a GitHub issue. Correctness bugs (wrong query results, a pruning
 decision that drops rows it shouldn't) are the highest priority — please
 include the exact schema, data, and query that reproduces it.
+
+Use `sh scripts/demo.sh` for the example workflow. For engine changes,
+run the seeded differential tests as part of `cargo test`; they compare
+pruning and parallel execution against a simple reference evaluator.
+Document format changes explicitly and update the footer magic version.

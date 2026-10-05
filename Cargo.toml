@@ -1,9 +1,13 @@
 [package]
 name = "stratum"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A small columnar storage engine and SQL-subset query processor, built to learn (and demonstrate) the database-internals techniques behind systems like Snowflake: block-based columnar layout, dictionary encoding, zone-map predicate pushdown, and vectorized/parallel scanning."
+description = "A columnar storage engine and SQL query processor built from scratch: adaptive delta/bit-packed/dictionary encoding, zone-map pruning over boolean expressions, vectorized late-materialized scans, and parallel aggregation."
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/pircxo/stratum"
+keywords = ["columnar", "database", "sql", "storage", "analytics"]
+categories = ["database-implementations", "command-line-utilities"]
 
 [[bin]]
 name = "stratum"
@@ -20,6 +24,8 @@ clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 rayon = "1.10"
 rand = "0.8"
+csv = "1.3"
+tempfile = "3.13"
 
 [profile.release]
 opt-level = 3

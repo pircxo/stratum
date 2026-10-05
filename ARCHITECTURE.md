@@ -1,195 +1,244 @@
-# Architecture notes
+# Architecture
 
-Why Stratum is built the way it is, including the trade-offs and the
-measured numbers — not just a list of features.
+Stratum demonstrates the storage and execution techniques of a small
+analytical engine. Its storage, encodings, parser, and executor are
+implemented in this repository; Rayon supplies parallel scheduling,
+`bincode` serializes metadata, and the `csv` crate handles CSV syntax.
 
-## Motivation
-
-Most of the application-level work I've done (full-stack web apps, ETL
-pipelines, dashboards) sits *on top of* a database without touching how
-one actually stores or scans data. Stratum exists to close that gap
-specifically: it's a small, hand-built version of the techniques that
-make columnar analytical databases (Snowflake, DuckDB, DataFusion,
-Polars) fast, built from scratch rather than read about.
-
-## The on-disk format
-
-A `.strat` file is a sequence of **row groups** — batches of up to 8192
-rows — and within each row group, data is stored **column by column**
-("chunks"), not row by row. After all row groups comes a **footer**:
-for every chunk, its byte offset, length, and (for integer columns) a
-**zone map** — the chunk's min and max value.
+## Data flow
 
 ```text
-[row group 0: col0 chunk][col1 chunk]...[colN chunk]
-[row group 1: col0 chunk][col1 chunk]...[colN chunk]
+CSV records -> type-checked rows -> buffered row group
+                                    -> column encodings + zone maps
+                                    -> chunks + footer -> .strat file
+
+SQL -> lexer -> parser -> AST -> bind names and types
+    -> prune row groups -> evaluate typed column batches
+    -> decode projection/aggregate columns for surviving groups
+    -> project or build partial aggregates -> merge -> order -> limit
+```
+
+`src/storage/` owns the file format and IO, `src/encoding.rs` owns chunk
+encodings, `src/query/` owns parsing and execution, and `src/bin/` exposes
+the engine through the CLI and benchmark.
+
+## Format 2
+
+```text
+[row group 0: column 0 chunk][column 1 chunk]...[column N chunk]
+[row group 1: column 0 chunk][column 1 chunk]...[column N chunk]
 ...
-[footer: bincode-serialized metadata]
-[footer_len: u64][magic: 8 bytes]
+[bincode FileFooter]
+[footer length: u64 little-endian][magic: 8 bytes, STRTFTR2]
 ```
 
-Two decisions worth calling out:
+Each group holds at most 8,192 rows. Tests can choose smaller groups.
+Chunks have a byte offset, encoded length, encoding tag, and typed zone
+map. The footer holds the schema, total rows, and group metadata. It lives
+at the end so the writer can stream groups without seeking back to patch
+a header. Metadata grows with the number of groups and columns, rather
+than the number of individual rows.
 
-- **The footer is at the end, not a fixed header at the start.** A
-  streaming writer never has to know the final row count or chunk
-  layout in advance, and never seeks backward to patch a header — it
-  just keeps writing row groups and remembers their metadata in memory
-  until `finish()`. This is the same trade-off Parquet makes, for the
-  same reason.
-- **Row groups, not one chunk per column for the whole file.** If
-  Stratum stored each column as *one* chunk for the entire file, the
-  zone map would cover the whole table — useless for pruning anything.
-  Splitting into many row groups, each with its *own* zone map, is what
-  makes pruning possible at all: a predicate can rule out *some* row
-  groups without ruling out the whole column.
+The writer validates schema and row types before mutating its buffers.
+`finish` flushes the last group, writes the footer and trailer, flushes
+the buffered writer, and syncs the file. A schema is immutable after
+creation. `TableWriter::create` refuses to overwrite a file; `new` accepts
+an empty caller-owned file. The CLI stages imports beside the destination
+and uses `persist_noclobber` after successful completion, preserving any
+existing destination and cleaning up failed imports. File data is synced;
+there is no parent-directory sync or crash-recovery protocol.
 
-## Encodings — and their honest limits
+The reader checks magic, a bounded footer length (256 MiB), schema, row
+counts, contiguous chunk coverage, offsets, encoding/type agreement, and
+ordered zone maps. Decoders check lengths, bit widths, dictionary indices,
+and UTF-8. These checks catch structural corruption; without checksums,
+a bit flip that still represents valid values can go undetected. Files
+must not be modified concurrently with queries.
 
-- **Int64: plain, fixed-width.** Every value is 8 bytes, little-endian.
-  No bit-packing, no delta encoding. This is a deliberately simple
-  baseline — a v2 would add delta encoding for monotonically increasing
-  columns (ids, timestamps) and bit-packing for low-cardinality integer
-  columns, both of which are large wins in real systems and neither of
-  which I implemented here in favour of spending the time on the query
-  engine and pruning instead.
-- **Utf8: dictionary-encoded.** Each chunk stores its distinct strings
-  once (sorted, for deterministic output) plus one small integer index
-  per row. This is the same idea Parquet, ORC, and Snowflake's own
-  storage all use for string columns, because real string columns are
-  usually far lower-cardinality than their row count.
-- **No general compression** (no LZ4/Zstd block compression on top of
-  the above). Real columnar formats layer general-purpose compression
-  over type-specific encoding; Stratum stops at the encoding layer.
+Format 1 used plain integers and 32-bit dictionary indices. Its trailer
+is recognized and rejected with an instruction to reload the source CSV;
+format 2 is a deliberate compatibility break. `bincode` enum layouts are
+part of this internal format, so changing their order requires another
+format version.
 
-## Zone-map pruning — and when it actually helps
+## Adaptive integer encoding
 
-`query::executor::is_prunable` checks, for every predicate on an
-integer column, whether a row group's `[min, max]` makes it
-*impossible* for any row in that group to satisfy the predicate — e.g.
-`value > 1000` can never be true in a group whose `max` is `900`. If
-so, the group is skipped entirely: never read, never decoded.
+Each chunk picks the smallest candidate, breaking ties in favor of simpler
+decoding: plain, frame of reference, then delta.
 
-This technique has a real limit, and the benchmark below is built to
-show it honestly rather than hide it. **Pruning only helps when a
-column's values are correlated with physical row order.** If a column's
-values are scattered uniformly at random with no relationship to
-insertion order, almost every row group's `[min, max]` already spans
-nearly the whole domain, and there's nothing to prune — no amount of
-clever indexing fixes that; the data itself has no structure to
-exploit. Snowflake's own documentation on micro-partition pruning makes
-the same point under the name "clustering." Columns that *do* have this
-property in practice — timestamps, auto-increment ids, anything written
-roughly in arrival order — are exactly where this pays off.
+| Encoding | Representation | Useful data |
+| --- | --- | --- |
+| Plain | 8-byte little-endian values | Full-width scattered integers |
+| Frame of reference | Chunk minimum, bit width, packed offsets from minimum | Narrow ranges in any order |
+| Delta bit packed | First value, then frame-of-reference packed consecutive differences | IDs, timestamps, near-constant steps |
 
-### Measured result
+The writer derives candidate sizes from counts and min/max statistics
+without encoding all candidates. It encodes only the selected one. Packing
+uses a `u128` accumulator to hold up to 64 new bits and 7 leftover bits;
+round-trip tests cover all widths from 0 through 64. Wrapping differences
+and reconstruction preserve signed extremes across `i64::MIN` and
+`i64::MAX`.
 
-`cargo run --release --bin bench_prune` generates 2,000,000 rows where
-`value` trends upward with row order (plus local noise — simulating a
-realistic clustered column like a timestamp), then runs
-`SELECT id FROM t WHERE value > 999000` three ways. One real run on the
-machine this was built on (a 2-core cloud sandbox):
+Zero-width packing stores no value bits. For 8,192 sequential IDs, all
+deltas are one, so an entire chunk is only 17 bytes: the first value plus
+the delta minimum/width header. This is an ideal synthetic pattern, not a
+compression ratio to expect for arbitrary integers.
 
+## String dictionaries
+
+Each string chunk stores sorted distinct strings, an index width, and one
+bit-packed index per row. A one-value dictionary needs zero index bits;
+a 16-value dictionary needs four. Strings stay in dictionary form after
+decoding. A predicate compares the literal with each dictionary entry,
+then maps that boolean result through the row indices. It avoids per-row
+string allocation and repeated comparison of the same value. Projection
+clones strings only for output rows. Dictionary overhead can outweigh its
+benefit on short, high-cardinality strings; no alternative string encoding
+is implemented.
+
+## Zone-map proofs
+
+A chunk's min/max gives two conservative facts about a filter: it may be
+impossible for any row to match, or every row may be guaranteed to match.
+For `x > v`, a group is impossible when `max <= v` and fully matched when
+`min > v`. Other comparisons use analogous bounds. String bounds compare
+UTF-8 strings lexicographically with the same Rust ordering used by the
+filter. They do not implement locale-aware collation.
+
+For expressions:
+
+| Expression | Prove no rows match | Prove every row matches |
+| --- | --- | --- |
+| `A AND B` | Either side impossible | Both sides fully match |
+| `A OR B` | Both sides impossible | Either side fully matches |
+| `NOT A` | A fully matches | A impossible |
+
+These rules never prune a matching row on valid data. They can miss a
+pruning opportunity when column correlations matter: per-column min/max
+cannot establish every relationship between predicates. Fully matched
+groups bypass filter-column IO unless that column is also needed for
+projection or aggregation. A filtered `COUNT(*)` can therefore read zero
+column bytes when every retained group is proven to match.
+
+## Batch execution and late materialization
+
+Binding resolves names to column indices and validates literal types once.
+Filters operate on typed column batches and boolean masks, rather than
+constructing a `Value` for every comparison. Boolean operators combine
+masks. This is batch vectorization, without explicit SIMD intrinsics.
+
+For each group, the executor first prunes or proves full matching. For a
+partially matching group it loads filter columns and produces selected
+row indices. Other needed columns are loaded only when at least one row
+survives. Unreferenced columns are never read. This is late materialization
+at column-chunk granularity: it does not read individual selected cells
+from compressed chunks.
+
+Rayon assigns independent groups to workers. Unix uses positioned reads;
+Windows uses repeated `seek_read` calls with explicit offsets. Exact-read
+handling accounts for short reads and interruptions. The executor collects
+results in physical group order, so serial and parallel projection scans
+have deterministic tie behavior. The full result is materialized in
+memory; there is no spill-to-disk operator or streaming result protocol.
+
+## Ordering and aggregates
+
+Projection ordering supports source columns, output aliases, and 1-based
+output positions, with multiple keys. Stable sorting preserves input
+order on ties. With a limit k, each group can retain its local top k before
+the final merge: any row ranked below k in its own group cannot enter the
+global top k. This reduces merged output; the implementation still sorts
+the local rows, rather than using a bounded heap or selection algorithm.
+
+Grouped queries build one hash table per group and merge partial
+accumulators by key. `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` have mergeable
+states. Integer sums use `i128`, then `SUM` checks the final `Int64` range;
+`AVG` converts the total to a floating-point result. `MIN` and `MAX` support
+both stored types. Global aggregates over no rows return one row: counts
+are zero and the others are null. Grouped empty input yields no rows.
+Groups are emitted in key order before explicit ordering for determinism.
+
+Unfiltered, ungrouped `COUNT`, `MIN`, and `MAX` can be answered from footer
+row counts and zone maps alone. All requested aggregates must support this
+path; adding `SUM` or `AVG` requires data scans. Metadata-only answers
+still validate column names and types. There are no stored nulls, so
+`COUNT(column)` equals `COUNT(*)`.
+
+## SQL boundary
+
+The grammar is documented in `src/query/ast.rs` and the README. `IN` and
+`BETWEEN` lower to comparison trees, sharing the same binding, pruning,
+and mask evaluation. Precedence is `NOT` > `AND` > `OR`; parentheses
+change grouping. The lexer supports doubled quotes in string literals.
+Only keyword matching is case-insensitive.
+
+There are no joins, subqueries, `HAVING`, scalar arithmetic, quoted
+identifiers, SQL comments, general scalar functions, or null predicates.
+The `FROM` identifier is not resolved against a catalog: the caller
+supplies one `TableReader`. `ORDER BY` on aggregate queries must name an
+output column/alias or position. Null aggregate outputs sort first
+ascending and last descending. These choices define Stratum's subset;
+they do not claim full compatibility with a SQL standard.
+
+## Recorded benchmark
+
+Command:
+
+```sh
+cargo run --locked --release --bin bench_prune -- --rows 2000000 --iterations 7 --threads 2 --seed 42
 ```
-pruning + parallel         1.82 ms   row groups scanned:    3/245   rows returned: 3669
-full scan, parallel       27.01 ms   row groups scanned:  245/245   rows returned: 3669
-full scan, serial         49.00 ms   row groups scanned:  245/245   rows returned: 3669
 
-Zone-map pruning skipped 242/245 row groups (98.8% of the table never decoded).
-Pruned+parallel was 27.0x faster than a full serial scan on this run.
-```
+Recorded October 6, 2026 (Asia/Tbilisi), on local macOS ARM64 with Rust
+1.97.0, release optimization and two Rayon workers. Each mode gets a warm-up
+and seven timed iterations; numbers are medians. Data generation, writing,
+and opening the reader are outside the timer. Result equivalence checks
+run outside the timer for every execution. OS page caches are warm; modes
+run in a fixed sequence. This is a reproducible demonstration, not a
+controlled cross-database performance study.
 
-All three runs return the exact same 3,669 rows — `tests/end_to_end.rs`
-has a dedicated test (`pruning_never_changes_the_result_only_how_much_gets_scanned`)
-asserting pruned and unpruned results are identical, because the whole
-point of this optimization is that it changes *how much work happens*,
-never *what the answer is*. The 27x figure is specific to this run, this
-data shape, and this (2-core) machine — more cores would widen the gap
-between the parallel and serial full scans further; it's reported as
-one real measurement, not a general claim.
+| Workload / mode | Median | Groups scanned | Encoded MiB read | Output rows |
+| --- | ---: | ---: | ---: | ---: |
+| Clustered, pruning + parallel | 0.18 ms | 3 / 245 | 0.03 | 3,552 |
+| Clustered, full scan + parallel | 2.85 ms | 245 / 245 | 3.34 | 3,552 |
+| Clustered, full scan + serial | 5.19 ms | 245 / 245 | 3.34 | 3,552 |
+| Random, pruning + parallel | 4.43 ms | 245 / 245 | 4.77 | 1,971 |
+| Random, full scan + parallel | 4.46 ms | 245 / 245 | 4.77 | 1,971 |
+| Random, full scan + serial | 8.16 ms | 245 / 245 | 4.77 | 1,971 |
+| Grouped COUNT/AVG, parallel | 26.53 ms | 245 / 245 | 4.34 | 16 |
+| Grouped COUNT/AVG, serial | 40.74 ms | 245 / 245 | 4.34 | 16 |
+| Unfiltered COUNT/MIN/MAX | <0.01 ms | 0 / 245 | 0.00 | 1 |
 
-## Parallel scanning
+The selective query is `SELECT id FROM t WHERE value > 999000`. Clustered
+values trend upward with local jitter; random values are uniform across
+the full domain. Both tables have sequential IDs and 16 sensor labels.
+The clustered table occupies 4.4 MiB and the random table 5.8 MiB.
+Sequential IDs cost about 0.002 encoded bytes per row; clustered values
+1.751, random values 2.501, and sensor labels 0.526. Footer overhead is
+included in total file size but excluded from column chunk byte counts.
 
-Row groups are independent — nothing about scanning one depends on
-another — so surviving (non-pruned) row groups are scanned concurrently
-with `rayon`'s parallel iterators. The part that makes this safe without
-a lock: `TableReader` reads via
-[`std::os::unix::fs::FileExt::read_at`](https://doc.rust-lang.org/std/os/unix/fs/trait.FileExt.html)
-(a positioned read, `pread` under the hood) instead of `seek` + `read`.
-`read_at` takes `&self`, not `&mut self`, and doesn't move a shared file
-cursor, so multiple threads can read different byte ranges of the same
-open file at once with no synchronization at all. This is Unix-specific
-— a cross-platform v2 would need an abstraction over Windows'
-equivalent (`seek_read`) — and that's noted rather than quietly assumed.
+Pruning skips 242/245 groups (98.8%) for clustered values. The measured
+28.7× improvement versus the serial baseline combines parallelism and
+pruning; versus the parallel baseline it is about 15.8× using rounded
+timings. Random data provides no pruning opportunities. More threads,
+other selectivity, cold IO, different cardinality, or different data order
+can change the results substantially.
 
-## The SQL subset, and where the line is drawn
+## Verification and next steps
 
-The parser (`query::lexer` + `query::parser`) is hand-written —
-tokenizer, then recursive-descent parser — specifically to practice that,
-not to avoid a parser-generator crate out of principle. It supports:
+Unit tests cover packing widths, extreme values, adaptive choices,
+dictionaries, lexing, and parsing. Integration tests cover exact query
+answers, aggregate semantics, overflow, top-k ties, metadata-only reads,
+malformed layouts, truncated files, schema/row validation, and complete
+CLI import/export behavior. Differential tests generate 720 queries over
+12 seeded tables and compare each against a naive in-memory evaluator in
+all four pruning/parallel combinations, including grouped aggregation.
 
-```
-SELECT (* | col, col, ...) FROM table
-  [WHERE cond (AND cond)*]
-  [ORDER BY col [ASC|DESC]]
-  [LIMIT n]
-```
+CI runs the same build, test, formatting, and Clippy checks on Linux,
+macOS, and Windows. A release benchmark smoke run checks the benchmark
+path; no unstable performance threshold gates merges.
 
-No `OR`, no parentheses, no joins, no aggregates (`COUNT`/`SUM`/...), no
-subqueries. That line is deliberate: each of those is a meaningfully
-larger feature (`OR` alone means predicates can no longer be evaluated
-as a simple AND-list for pruning *or* execution — it needs a proper
-expression tree), and the project's actual goal was storage + pruning +
-execution, not SQL coverage for its own sake. A `rejects_or_since_it_is_out_of_scope`
-test documents this as an intentional boundary, not a bug someone will
-"find."
-
-## Testing strategy
-
-- **Unit tests** for the pieces that are easy to get subtly wrong in
-  isolation: the lexer (keyword case-insensitivity, negative numbers,
-  `!=` vs `<>`), the parser (full statements, rejecting `OR`, rejecting
-  trailing garbage), and the encodings (round-trips, and a dictionary
-  size check against raw bytes).
-- **End-to-end tests** (`tests/end_to_end.rs`) write a real `.strat`
-  file and query it through the actual parser + executor — the same
-  path the CLI uses — asserting on exact expected rows, not just "it
-  didn't crash." These also assert the properties that matter most for
-  a storage/query engine specifically: pruned and unpruned scans return
-  identical results, and sequential and parallel scans return identical
-  results.
-- **23 tests total**, run in CI (`.github/workflows/ci.yml`) alongside
-  `cargo clippy -- -D warnings` and `cargo fmt --check`.
-
-### A real toolchain-drift bug, and the fix
-
-CI failed once on this project in a way that's worth documenting rather
-than quietly fixing: `decode_int64_chunk` used `bytes.chunks_exact(8)`,
-which was clean under the local dev machine's clippy but failed CI's
-`cargo clippy -- -D warnings` with `chunks_exact_to_as_chunks` — a lint
-that only exists in a newer clippy than the one installed locally.
-`dtolnay/rust-toolchain@stable` always resolves to *whatever's currently
-stable*, so "works on my machine" and "passes CI" can silently drift
-apart as new Rust releases ship new lints. The fix was two-part: rewrite
-the decode loop to index by offset instead of `chunks_exact` (clearer
-anyway, and not tied to any one clippy version's opinion), and pin the
-toolchain explicitly — `rust-toolchain.toml` plus
-`dtolnay/rust-toolchain@1.97.0` in CI — so "stable" can't quietly become
-a moving target again.
-
-## What a v2 would add first
-
-In priority order, if this needed to handle more than a portfolio demo:
-
-1. **Delta/bit-packed integer encoding** — the single biggest storage
-   and scan-speed win left on the table, and it's a natural fit for
-   exactly the clustered-column case pruning already targets.
-2. **`OR` and parenthesized expressions** in the query language, via a
-   proper expression AST (currently predicates are a flat AND-list).
-3. **A cross-platform positioned-read abstraction**, so parallel
-   scanning isn't Unix-only.
-4. **Statistics-aware block skipping for strings** (currently zone maps
-   only cover `Int64`) — lexicographic min/max per chunk would make
-   range predicates on string columns pruneable too.
-5. **Alembic/migration-style schema evolution** — right now a table's
-   schema is fixed at creation; adding a column means rewriting the
-   file.
+Natural extensions are checksummed chunks, a streaming/spilling executor,
+a bounded-heap top-k operator, more stored types with null bitmaps, and
+compression layered over encodings. Schema evolution, transactions, and
+joins require larger format/execution designs. They remain beyond this
+portfolio project's supported scope.

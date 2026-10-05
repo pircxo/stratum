@@ -1,7 +1,9 @@
 //! A hand-written tokenizer — no parser-generator, no regex. Keywords are
 //! matched case-insensitively (`SELECT`, `select`, and `Select` are the
 //! same token); identifiers and string literal *contents* keep whatever
-//! case was typed.
+//! case was typed. Aggregate names (`COUNT`, `SUM`, ...) are *not*
+//! keywords — they lex as identifiers and the parser recognises them by
+//! the `(` that follows, so a column may still be called `count`.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -9,6 +11,12 @@ pub enum Token {
     From,
     Where,
     And,
+    Or,
+    Not,
+    In,
+    Between,
+    As,
+    Group,
     Order,
     By,
     Asc,
@@ -18,6 +26,8 @@ pub enum Token {
     Star,
     Comma,
     Semicolon,
+    LParen,
+    RParen,
 
     Ident(String),
     Int(i64),
@@ -81,6 +91,14 @@ impl<'a> Lexer<'a> {
                 self.chars.next();
                 Ok(Token::Semicolon)
             }
+            '(' => {
+                self.chars.next();
+                Ok(Token::LParen)
+            }
+            ')' => {
+                self.chars.next();
+                Ok(Token::RParen)
+            }
             '=' => {
                 self.chars.next();
                 Ok(Token::Eq)
@@ -140,6 +158,10 @@ impl<'a> Lexer<'a> {
         let mut s = String::new();
         loop {
             match self.chars.next() {
+                Some('\'') if self.chars.peek() == Some(&'\'') => {
+                    self.chars.next();
+                    s.push('\'');
+                }
                 Some('\'') => return Ok(Token::Str(s)),
                 Some(c) => s.push(c),
                 None => return Err(LexError("unterminated string literal".to_string())),
@@ -171,19 +193,35 @@ impl<'a> Lexer<'a> {
         while matches!(self.chars.peek(), Some(c) if c.is_alphanumeric() || *c == '_') {
             s.push(self.chars.next().unwrap());
         }
-        Ok(match s.to_ascii_uppercase().as_str() {
-            "SELECT" => Token::Select,
-            "FROM" => Token::From,
-            "WHERE" => Token::Where,
-            "AND" => Token::And,
-            "ORDER" => Token::Order,
-            "BY" => Token::By,
-            "ASC" => Token::Asc,
-            "DESC" => Token::Desc,
-            "LIMIT" => Token::Limit,
-            _ => Token::Ident(s),
-        })
+        Ok(keyword(&s).unwrap_or(Token::Ident(s)))
     }
+}
+
+fn keyword(word: &str) -> Option<Token> {
+    Some(match word.to_ascii_uppercase().as_str() {
+        "SELECT" => Token::Select,
+        "FROM" => Token::From,
+        "WHERE" => Token::Where,
+        "AND" => Token::And,
+        "OR" => Token::Or,
+        "NOT" => Token::Not,
+        "IN" => Token::In,
+        "BETWEEN" => Token::Between,
+        "AS" => Token::As,
+        "GROUP" => Token::Group,
+        "ORDER" => Token::Order,
+        "BY" => Token::By,
+        "ASC" => Token::Asc,
+        "DESC" => Token::Desc,
+        "LIMIT" => Token::Limit,
+        _ => return None,
+    })
+}
+
+/// Whether `word` lexes as a keyword (case-insensitively) — such a name
+/// could never be referenced as a column, so the writer rejects it.
+pub fn is_keyword(word: &str) -> bool {
+    keyword(word).is_some()
 }
 
 #[cfg(test)]
@@ -251,7 +289,56 @@ mod tests {
     }
 
     #[test]
+    fn doubled_quote_escapes_a_quote() {
+        assert_eq!(
+            Lexer::tokenize("'it''s'").unwrap(),
+            vec![Token::Str("it's".into()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn boolean_keywords_and_parens() {
+        assert_eq!(
+            Lexer::tokenize("NOT (a IN (1)) or b BETWEEN 1 AND 2").unwrap(),
+            vec![
+                Token::Not,
+                Token::LParen,
+                Token::Ident("a".into()),
+                Token::In,
+                Token::LParen,
+                Token::Int(1),
+                Token::RParen,
+                Token::RParen,
+                Token::Or,
+                Token::Ident("b".into()),
+                Token::Between,
+                Token::Int(1),
+                Token::And,
+                Token::Int(2),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lone_minus_is_an_error() {
+        assert!(Lexer::tokenize("a - b").is_err());
+    }
+
+    #[test]
     fn unterminated_string_is_an_error() {
         assert!(Lexer::tokenize("'oops").is_err());
+    }
+
+    #[test]
+    fn doubled_quotes_escape_sql_strings() {
+        assert_eq!(
+            Lexer::tokenize("'O''Brien'").unwrap(),
+            vec![Token::Str("O'Brien".into()), Token::Eof]
+        );
+        assert_eq!(
+            Lexer::tokenize("''").unwrap(),
+            vec![Token::Str(String::new()), Token::Eof]
+        );
     }
 }
