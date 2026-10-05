@@ -1,0 +1,7 @@
+/target
+Cargo.lock.bak
+*.strat
+/bench-data/
+.DS_Store
+.vscode/
+.idea/
