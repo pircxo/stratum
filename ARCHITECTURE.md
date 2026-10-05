@@ -160,6 +160,22 @@ test documents this as an intentional boundary, not a bug someone will
 - **23 tests total**, run in CI (`.github/workflows/ci.yml`) alongside
   `cargo clippy -- -D warnings` and `cargo fmt --check`.
 
+### A real toolchain-drift bug, and the fix
+
+CI failed once on this project in a way that's worth documenting rather
+than quietly fixing: `decode_int64_chunk` used `bytes.chunks_exact(8)`,
+which was clean under the local dev machine's clippy but failed CI's
+`cargo clippy -- -D warnings` with `chunks_exact_to_as_chunks` — a lint
+that only exists in a newer clippy than the one installed locally.
+`dtolnay/rust-toolchain@stable` always resolves to *whatever's currently
+stable*, so "works on my machine" and "passes CI" can silently drift
+apart as new Rust releases ship new lints. The fix was two-part: rewrite
+the decode loop to index by offset instead of `chunks_exact` (clearer
+anyway, and not tied to any one clippy version's opinion), and pin the
+toolchain explicitly — `rust-toolchain.toml` plus
+`dtolnay/rust-toolchain@1.97.0` in CI — so "stable" can't quietly become
+a moving target again.
+
 ## What a v2 would add first
 
 In priority order, if this needed to handle more than a portfolio demo:

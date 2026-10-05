@@ -27,10 +27,11 @@ pub fn decode_int64_chunk(bytes: &[u8], row_count: usize) -> Vec<i64> {
         row_count * 8,
         "corrupt int64 chunk: size mismatch"
     );
-    bytes
-        .chunks_exact(8)
-        .take(row_count)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+    (0..row_count)
+        .map(|i| {
+            let start = i * 8;
+            i64::from_le_bytes(bytes[start..start + 8].try_into().unwrap())
+        })
         .collect()
 }
 
