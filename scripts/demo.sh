@@ -3,6 +3,19 @@ set -eu
 
 project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
+
+# Existing terminal sessions may not have loaded rustup's shell setup.
+if ! command -v cargo >/dev/null 2>&1; then
+  cargo_env="${CARGO_HOME:-$HOME/.cargo}/env"
+  if [ -f "$cargo_env" ]; then
+    . "$cargo_env"
+  fi
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  printf '%s\n' 'Cargo was not found. Install Rust from https://rustup.rs/ and retry.' >&2
+  exit 1
+fi
+
 demo_dir=$(mktemp -d "${TMPDIR:-/tmp}/stratum-demo.XXXXXX")
 trap 'rm -rf "$demo_dir"' EXIT HUP INT TERM
 

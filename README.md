@@ -28,6 +28,12 @@ also shows grouped aggregates, metadata-only queries, and CSV export. It
 uses a temporary directory and cleans up automatically. On Windows, the
 commands above work in PowerShell.
 
+If Rust is installed but your Terminal reports `cargo: command not found`,
+run `source "$HOME/.cargo/env"` to enable it in the current session. The
+demo script loads this setup automatically when Cargo is missing from
+`PATH`. For future terminals, add `source "$HOME/.cargo/env"` to your
+shell startup file (usually `~/.zshrc` on macOS).
+
 ## Storage and execution
 
 - **Row groups of up to 8,192 rows**, stored column by column with a footer
